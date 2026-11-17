@@ -1008,10 +1008,15 @@
     /* Models list — id is the API model string */
     const MODELS = [
       // OpenAI
+      { id: "gpt-6-astra",             label: "GPT-6 Astra",        provider: "openai",    supports: { think: true,  search: true  }, group: "OpenAI" },
+      { id: "gpt-6.1-sol",             label: "GPT-6.1 Sol",        provider: "openai",    supports: { think: true,  search: true  }, group: "OpenAI" },
       { id: "gpt-5.5",                 label: "GPT-5.5",            provider: "openai",    supports: { think: true,  search: true  }, group: "OpenAI" },
       { id: "gpt-5.5-pro",             label: "GPT-5.5 Pro",        provider: "openai",    supports: { think: true,  search: true  }, group: "OpenAI" },
 
       // Anthropic
+      { id: "claude-mythos-5-2",       label: "Claude Mythos 5.2",  provider: "anthropic", supports: { think: true,  search: true  }, group: "Anthropic" },
+      { id: "claude-fable-5-2",        label: "Claude Fable 5.2",   provider: "anthropic", supports: { think: true,  search: true  }, group: "Anthropic" },
+      { id: "claude-opus-5-5",         label: "Claude Opus 5.5",    provider: "anthropic", supports: { think: true,  search: true  }, group: "Anthropic" },
       { id: "claude-opus-4-7",         label: "Claude Opus 4.7",    provider: "anthropic", supports: { think: true,  search: true  }, group: "Anthropic" },
       { id: "claude-sonnet-4-6",       label: "Claude Sonnet 4.6",  provider: "anthropic", supports: { think: true,  search: true  }, group: "Anthropic" },
 
@@ -1729,8 +1734,10 @@
       //                much to think based on the prompt, just like ChatGPT web.
       // We always emit `summary: "auto"` so we surface whatever reasoning the model
       // decides to do in the collapsible Thinking block.
+      // GPT-6 family accepts low/medium/high/xhigh/max (Astra rejects "none").
+      const isGpt6 = modelId.startsWith("gpt-6");
       if (opts.features.think) {
-        body.reasoning = { effort: "high", summary: "auto" };
+        body.reasoning = { effort: isGpt6 ? "xhigh" : "high", summary: "auto" };
       } else {
         body.reasoning = { effort: "medium", summary: "auto" };
       }
@@ -2063,9 +2070,20 @@
       // Adaptive thinking is recommended for Opus 4.6, Sonnet 4.6, and newer.
       // budget_tokens is deprecated on these models. Older models (claude-3.x,
       // Sonnet 4.5 and below) still require the legacy enabled+budget_tokens path.
-      const usesAdaptive = modelId.includes("opus-4") || modelId.includes("opus-5")
+      // Claude 5-generation models (Fable / Mythos 5.x, Opus 5.5) always think:
+      //   explicit {type:"disabled"} or budget_tokens returns a 400, so depth is
+      //   controlled only through output_config.effort. Their thinking text is
+      //   omitted by default, so ask for a summary to fill the Thinking block.
+      const isGen5 = /^claude-(fable|mythos)-5/.test(modelId) || modelId.startsWith("claude-opus-5-5");
+      const usesAdaptive = isGen5 || modelId.includes("opus-4") || modelId.includes("opus-5")
                         || modelId.includes("sonnet-4-6") || modelId.includes("sonnet-4.6");
-      if (usesAdaptive) {
+      if (isGen5) {
+        body.thinking = { type: "adaptive", display: "summarized" };
+        // Fable/Mythos: start at "high". Opus 5.5 defaults to "medium", so set it explicitly.
+        const isFableMythos = /^claude-(fable|mythos)-5/.test(modelId);
+        body.output_config = { effort: opts.features.think ? "xhigh" : (isFableMythos ? "high" : "medium") };
+        body.max_tokens = opts.features.think ? 64000 : 32000;
+      } else if (usesAdaptive) {
         body.thinking = { type: "adaptive" };
         if (opts.features.think) {
           body.output_config = { effort: "max" };
@@ -2082,10 +2100,18 @@
         }
       }
 
+      // Server-side refusal fallback (Fable 5.2 / Opus 5.5): if a safety classifier
+      // declines, the API reroutes to a suitable model instead of returning an empty turn.
+      const useFallbacks = modelId === "claude-fable-5-2" || modelId === "claude-opus-5-5";
+      if (useFallbacks) body.fallbacks = "default";
+
       // Web search — always available; Anthropic's default tool_choice is "auto"
       // so the model only invokes web_search when the question warrants it,
       // matching claude.ai's behaviour. (Each invocation costs Anthropic credits.)
-      body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+      // Newer models get the dynamic-filtering web search tool.
+      const newSearch = isGen5 || modelId.includes("opus-4-6") || modelId.includes("opus-4-7")
+                     || modelId.includes("opus-4-8") || modelId.includes("sonnet-4-6");
+      body.tools = [{ type: newSearch ? "web_search_20260209" : "web_search_20250305", name: "web_search" }];
 
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -2094,6 +2120,7 @@
           "x-api-key": apiKey,
           "anthropic-version": "2023-06-01",
           "anthropic-dangerous-direct-browser-access": "true",
+          ...(useFallbacks ? { "anthropic-beta": "server-side-fallback-2026-07-01" } : {}),
         },
         body: JSON.stringify(body),
         signal: opts.signal,
@@ -2113,8 +2140,9 @@
           if (p.delta.type === "text_delta" && p.delta.text) opts.onText(p.delta.text);
           if (p.delta.type === "thinking_delta" && p.delta.thinking) opts.onThinking(p.delta.thinking);
         }
-        if (p.type === "message_delta" && p.delta && p.delta.stop_reason === "end_turn") {
-          // end
+        if (p.type === "message_delta" && p.delta && p.delta.stop_reason === "refusal") {
+          const cat = p.delta.stop_details && p.delta.stop_details.category;
+          opts.onText(`\n\n_The model declined this request${cat ? ` (${cat})` : ""}._`);
         }
       });
     }
